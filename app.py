@@ -7,140 +7,170 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 from google import genai
 from google.genai import types
+from streamlit_gsheets import GSheetsConnection
 
-# --- 1. CONFIGURATION & UI ---
-st.set_page_config(page_title="AI Invoice Agent", page_icon="📄", layout="centered")
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="Universal Invoice Agent", page_icon="🏗️", layout="wide")
 
-st.title("📄 AI Invoice Data Extractor")
+st.title("🏗️ Universal AI Invoice Agent")
 st.markdown("""
-Upload your **Stone** or **Cement** PDFs. This agent will automatically:
-1. Decide if the file is a digital document or a scan.
-2. Scan all pages for hidden invoices.
-3. Format everything for your Master Excel Register.
+**How to use:**
+1. **Office Setup:** (Optional) Upload an Excel file in the sidebar to set your custom columns.
+2. **Input Data:** Use **Office Mode** for existing PDFs/Images or **Site Mode** for phone photos.
+3. **Sync:** Review the data and click **'Send to Office'** to update the central ledger.
 """)
 
-# --- 2. API KEY SECRETS LOGIC ---
-# This looks for GEMINI_API_KEY in Streamlit Cloud "Secrets" first.
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-else:
-    # Fallback sidebar for local testing or if secrets aren't set yet
+# --- 2. SECRETS & API KEY (Cloud & Local Support) ---
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    else:
+        api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
+except Exception:
     api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
-COLUMNS = [
-    "S.No", "Invoice Number", "Invoice Date", "Supplier Name", "Customer Name",
-    "SAP Invoice Number", "Item Description", "HSN Code", "UoM", 
-    "Quantity (MT/Nos)", "Rate per Unit (₹)", "Taxable Value (₹)", 
-    "GST Rate %", "CGST & SGST Amt (₹)", "IGST Amt (₹)", 
-    "Freight Charges (₹)", "Total Invoice Value (₹)"
+# --- 3. TEMPLATE LOGIC (The Brain) ---
+st.sidebar.header("1. Setup Your Ledger")
+template_file = st.sidebar.file_uploader("Upload Master Excel Template (Optional)", type=["xlsx", "csv"])
+
+# Default headers used if no Excel is provided
+default_headers = [
+    "Invoice Number", "Invoice Date", "Supplier Name", 
+    "Item Description", "Quantity", "Total Amount"
 ]
 
-# --- 3. PROMPT LOGIC ---
-def get_strict_prompt(context_type):
-    return f"""
-    Act as a precise data entry clerk. Extract EVERY line item from EVERY invoice found in this {context_type} into a JSON LIST.
-    
-    ### COLUMN MAPPING RULES:
-    1. **Invoice Number**: Look for 'Ref. Inv No', 'Invoice No', or 'Inv No'.
-    2. **Supplier Name**: Use 'SAGAR CEMENTS LIMITED' or 'SRI LAXMI STONE PRODUCTS'. 
-    3. **Item Description**: Use ONLY the product name (e.g., 'OPC 43 HDPE BAG', '10MM').
-    4. **Taxable Value (₹)**: Basic value before GST.
-    5. **CGST & SGST Amt (₹)**: Sum the CGST and SGST amounts.
-    
-    Return a JSON LIST of objects with these keys: {COLUMNS}
-    """
+if template_file:
+    if template_file.name.endswith('.csv'):
+        df_temp = pd.read_csv(template_file)
+    else:
+        df_temp = pd.read_excel(template_file)
+    target_headers = df_temp.columns.tolist()
+    st.sidebar.success(f"Using Custom Template: {len(target_headers)} fields")
+else:
+    target_headers = default_headers
+    st.sidebar.info("No template. Using Default Headers.")
 
-import google.api_core.exceptions as google_exceptions
+# Auto-add tracking fields for your central database
+if "Site Name" not in target_headers: target_headers.append("Site Name")
+if "Timestamp" not in target_headers: target_headers.append("Timestamp")
 
-def extract_data(client, content, headers, is_image=False):
+# --- 4. BATCH EXTRACTION ENGINE ---
+def extract_data_batch(client, content_list, headers, is_image=False):
+    """Sends multiple pages in ONE request to save quota and speed up processing."""
     model_id = "gemini-3.1-flash-lite"
-    prompt = get_dynamic_prompt(headers)
+    prompt = f"""
+    Extract ALL invoice line items from ALL provided pages into a single JSON LIST.
+    Use these exact keys: {headers}. 
+    If a field is missing on a page, use null.
+    """
     
-    parts = [prompt, types.Part.from_bytes(data=content, mime_type="image/jpeg")] if is_image else [prompt, content]
+    parts = [prompt]
+    if is_image:
+        for img_bytes in content_list:
+            parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+    else:
+        parts.append(content_list[0]) # Single text block for digital PDFs
 
-    # --- SMART RETRY LOGIC ---
-    max_retries = 3
-    for attempt in range(max_retries):
+    # Retry logic for 429 Resource Exhausted errors
+    for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model=model_id, contents=parts,
+                model=model_id, 
+                contents=parts,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             clean_json = response.text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_json)
-        
-        except google_exceptions.ResourceExhausted:
-            if attempt < max_retries - 1:
-                wait_time = 40  # Wait 40 seconds if quota is hit
-                st.warning(f"Quota hit. Resting for {wait_time}s before retrying page...")
-                time.sleep(wait_time)
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                st.warning(f"AI is busy. Resting 30s before retry (Attempt {attempt+1}/3)...")
+                time.sleep(30)
             else:
-                raise Exception("Google API limit reached. Please try again in 1 minute.")
+                st.error(f"Extraction failed: {e}")
+                return []
 
-# --- 4. WEB INTERFACE ---
-uploaded_files = st.file_uploader("Upload PDF Invoices", type="pdf", accept_multiple_files=True)
+# --- 5. MAIN INTERFACE ---
+if not api_key:
+    st.warning("Please provide an API Key in the sidebar or secrets to begin.")
+else:
+    client = genai.Client(api_key=api_key)
+    all_results = []
+    
+    site_location = st.text_input("Project Site Name", "Hyderabad Main Site")
+    tab1, tab2 = st.tabs(["📁 Office Mode (Bulk Upload)", "📸 Site Mode (Camera Snap)"])
 
-if uploaded_files:
-    if not api_key:
-        st.warning("Please enter an API Key in the sidebar or add it to Streamlit Secrets to proceed.")
-    else:
-        client = genai.Client(api_key=api_key)
-        all_extracted_items = []
-
-        if st.button("🚀 Process Invoices"):
-            for uploaded_file in uploaded_files:
-                st.info(f"Analyzing {uploaded_file.name}...")
-                file_bytes = uploaded_file.read()
+    # --- TAB 1: BULK PROCESSING ---
+    with tab1:
+        uploaded_files = st.file_uploader("Upload PDFs or Images", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
+        if st.button("🚀 Process All Files"):
+            for f in uploaded_files:
+                st.info(f"Processing {f.name}...")
+                f_bytes = f.read()
                 
-                # Check if PDF has selectable text
-                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                    raw_text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-                
-                try:
-                    if len(raw_text.strip()) > 50:
-                        st.write("✅ Mode: Text (Digital PDF)")
-                        items = extract_data(client, raw_text)
-                    else:
-                        st.write("📸 Mode: Vision (Scanned Image - Processing all pages...)")
-                        images = convert_from_bytes(file_bytes)
-                        items = []
-                        progress_bar = st.progress(0)
-                        for i, img in enumerate(images):
-                            img_byte_arr = io.BytesIO()
-                            img.save(img_byte_arr, format='JPEG')
-                            items.extend(extract_data(client, img_byte_arr.getvalue(), is_image=True))
-                            progress_bar.progress((i + 1) / len(images))
-                            time.sleep(4) # Quota guard for free tier
+                if f.type == "application/pdf":
+                    with pdfplumber.open(io.BytesIO(f_bytes)) as pdf:
+                        text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
                     
-                    all_extracted_items.extend(items)
+                    if len(text.strip()) > 100:
+                        # Digital PDF: Process as text batch
+                        items = extract_data_batch(client, [text], target_headers)
+                        all_results.extend(items)
+                    else:
+                        # Scanned PDF: Process as image batch
+                        st.write("📸 Scanned PDF detected. Converting pages to images...")
+                        images = convert_from_bytes(f_bytes)
+                        image_parts = []
+                        for img in images:
+                            buf = io.BytesIO()
+                            img.save(buf, format='JPEG')
+                            image_parts.append(buf.getvalue())
+                        
+                        # Process all pages at once (Efficient)
+                        items = extract_data_batch(client, image_parts, target_headers, is_image=True)
+                        all_results.extend(items)
+                else:
+                    # Single Image Upload
+                    items = extract_data_batch(client, [f_bytes], target_headers, is_image=True)
+                    all_results.extend(items)
+
+    # --- TAB 2: CAMERA CAPTURE ---
+    with tab2:
+        cam_image = st.camera_input("Snap a photo of the invoice/receipt")
+        if cam_image and st.button("✨ Extract from Photo"):
+            with st.spinner("AI is reading the photo..."):
+                items = extract_data_batch(client, [cam_image.getvalue()], target_headers, is_image=True)
+                all_results.extend(items)
+
+    # --- 6. RESULTS & CLOUD SYNC ---
+    if all_results:
+        st.divider()
+        df_final = pd.DataFrame(all_results)
+        
+        # Add metadata for tracking
+        df_final["Site Name"] = site_location
+        df_final["Timestamp"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+        
+        # Ensure only target headers are shown in correct order
+        df_final = df_final.reindex(columns=target_headers)
+        
+        st.subheader("Extracted Data Preview")
+        st.dataframe(df_final)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("✅ Send to Office Master Ledger"):
+                try:
+                    conn = st.connection("gsheets", type=GSheetsConnection)
+                    # Worksheet must be named 'Sheet1'
+                    existing = conn.read(worksheet="Sheet1")
+                    updated = pd.concat([existing, df_final], ignore_index=True)
+                    conn.update(worksheet="Sheet1", data=updated)
+                    st.success("Successfully updated the Office Master Ledger!")
                 except Exception as e:
-                    st.error(f"Error processing {uploaded_file.name}: {e}")
+                    st.error(f"GSheets Sync Failed: {e}. Check your Secrets settings.")
 
-            # --- 5. DATA CLEANING & DOWNLOAD ---
-            if all_extracted_items:
-                df = pd.DataFrame(all_extracted_items)
-                
-                # Filter out garbage headers or empty rows
-                if 'Item Description' in df.columns:
-                    df = df[~df['Item Description'].str.upper().isin(["CEMENT", "TOTAL", "SUBTOTAL"])]
-                
-                # Ensure all columns exist and are in order
-                df = df.reindex(columns=COLUMNS)
-                df['S.No'] = range(1, len(df) + 1)
-
-                st.success(f"Successfully extracted {len(df)} line items!")
-                st.dataframe(df)
-
-                # Excel Export
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False)
-                
-                st.download_button(
-                    label="📥 Download Invoice_Register.xlsx",
-                    data=output.getvalue(),
-                    file_name="Invoice_Register_Export.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.error("No data could be extracted. Please check the PDF quality.")
+        with col_b:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_final.to_excel(writer, index=False)
+            st.download_button("📥 Download Excel Locally", output.getvalue(), "Invoice_Data.xlsx")

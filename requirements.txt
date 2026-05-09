@@ -1,7 +1,9 @@
 google-genai
+google-api-core
 streamlit
 pdfplumber
 pdf2image
 pandas
 openpyxl
 Pillow
+st-gsheets-connection
