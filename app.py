@@ -50,23 +50,32 @@ def get_strict_prompt(context_type):
     Return a JSON LIST of objects with these keys: {COLUMNS}
     """
 
-def extract_data(client, content, is_image=False):
+import google.api_core.exceptions as google_exceptions
+
+def extract_data(client, content, headers, is_image=False):
     model_id = "gemini-3.1-flash-lite"
-    prompt = get_strict_prompt("image scan" if is_image else "text")
+    prompt = get_dynamic_prompt(headers)
     
-    if is_image:
-        parts = [prompt, types.Part.from_bytes(data=content, mime_type="image/jpeg")]
-    else:
-        parts = [prompt, content]
-    
-    response = client.models.generate_content(
-        model=model_id, 
-        contents=parts,
-        config=types.GenerateContentConfig(response_mime_type="application/json")
-    )
-    # Clean the response text to ensure valid JSON
-    clean_json = response.text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean_json)
+    parts = [prompt, types.Part.from_bytes(data=content, mime_type="image/jpeg")] if is_image else [prompt, content]
+
+    # --- SMART RETRY LOGIC ---
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_id, contents=parts,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_json)
+        
+        except google_exceptions.ResourceExhausted:
+            if attempt < max_retries - 1:
+                wait_time = 40  # Wait 40 seconds if quota is hit
+                st.warning(f"Quota hit. Resting for {wait_time}s before retrying page...")
+                time.sleep(wait_time)
+            else:
+                raise Exception("Google API limit reached. Please try again in 1 minute.")
 
 # --- 4. WEB INTERFACE ---
 uploaded_files = st.file_uploader("Upload PDF Invoices", type="pdf", accept_multiple_files=True)
