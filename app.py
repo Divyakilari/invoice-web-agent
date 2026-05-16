@@ -32,7 +32,6 @@ except Exception:
 def extract_data_fast(client, file_bytes, filename):
     models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-1.5-flash"]
     
-    # Updated prompt with the skip condition built-in
     prompt = f"""
     Act as a professional construction auditor. Examine the attached PDF document carefully.
     
@@ -50,6 +49,11 @@ def extract_data_fast(client, file_bytes, filename):
     - If billing is local, put combined tax in 'CGST & SGST Amt (₹)'.
     - Extract the absolute FULL, COMPLETE legal name for 'Supplier Name' and 'Customer Name' exactly as printed on the document header. Do not shorten or omit any words.
     - Capture the COMPLETE item description exactly as written for every line item.
+    
+    CRITICAL NUMERIC TOTAL VERIFICATION:
+    - Look specifically for the numeric currency value fields.
+    - DO NOT concatenate or glue separate figures, distance markers (e.g., Kms), phone numbers, tax lines, or tracking IDs together. 
+    - Verify individual rows before compilation.
     
     Output: Return a JSON LIST only.
     """
@@ -116,7 +120,6 @@ if api_key:
                 file_bytes = f.read()
                 items = extract_data_fast(client, file_bytes, f.name)
                 
-                # Check if the AI returned an empty array indicating a skip condition
                 if not items:
                     st.info(f"⏭️ Skipped {f.name} (Contains 'NOT FOR SALE' & 'DELIVERY CHALLAN')")
                 else:
@@ -154,6 +157,23 @@ if st.session_state.all_results:
             keep="first"
         )
 
+        # Programmatic Mathematical Re-validation Pass for individual components
+        for idx, row in df_raw.iterrows():
+            rate = row.get("GST Rate %", 0)
+            if rate <= 0 or rate > 28:
+                rate = 18.0
+                df_raw.at[idx, "GST Rate %"] = 18.0
+                
+            calc_tax = round(row["Taxable Value (₹)"] * (rate / 100), 2)
+            
+            if row["IGST Amt (₹)"] > 0 and row["CGST & SGST Amt (₹)"] == 0:
+                df_raw.at[idx, "IGST Amt (₹)"] = calc_tax
+            elif row["CGST & SGST Amt (₹)"] > 0 and row["IGST Amt (₹)"] == 0:
+                df_raw.at[idx, "CGST & SGST Amt (₹)"] = calc_tax
+            else:
+                df_raw.at[idx, "IGST Amt (₹)"] = calc_tax
+                df_raw.at[idx, "CGST & SGST Amt (₹)"] = 0.0
+
         # B. AGGREGATION LOGIC
         df_final = df_raw.groupby(["Invoice Number", "Supplier Name"], as_index=False).agg({
             "Invoice Date": "first",
@@ -171,6 +191,15 @@ if st.session_state.all_results:
             "Freight Charges (₹)": "sum",
             "Total Invoice Value (₹)": "sum"
         })
+        
+        # --- FIX: HARD MATHEMATICAL RECONCILIATION FOR TOTAL INVOICE VALUE ---
+        # Instead of trusting a fuzzy mask, forcefully overwrite total value to guarantee balance math
+        df_final["Total Invoice Value (₹)"] = (
+            df_final["Taxable Value (₹)"] + 
+            df_final["CGST & SGST Amt (₹)"] + 
+            df_final["IGST Amt (₹)"] + 
+            df_final["Freight Charges (₹)"]
+        ).round(2)
         
         # C. SEQUENCE RE-NUMBERING
         df_final = df_final.reset_index(drop=True)
