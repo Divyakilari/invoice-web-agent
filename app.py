@@ -32,9 +32,15 @@ except Exception:
 def extract_data_fast(client, file_bytes, filename):
     models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-1.5-flash"]
     
+    # Updated prompt with the skip condition built-in
     prompt = f"""
-    Act as a professional construction auditor. Extract all individual line items from the attached PDF.
+    Act as a professional construction auditor. Examine the attached PDF document carefully.
     
+    CRITICAL FILTER RULE:
+    Check if the document contains BOTH the phrase "DELIVERY CHALLAN" and "NOT FOR SALE" anywhere on the pages. 
+    If BOTH phrases are present, you MUST return an empty JSON array [] as the entire output. Do not extract anything.
+    
+    Otherwise, extract all individual line items from the attached PDF.
     Target Headers: {HARDCODED_FIELDS}
     
     Mapping Rules:
@@ -42,6 +48,7 @@ def extract_data_fast(client, file_bytes, filename):
     - Map 'Gross Total' or 'Net Amount' to 'Total Invoice Value (₹)'.
     - If billing is inter-state, put tax in 'IGST Amt (₹)'. 
     - If billing is local, put combined tax in 'CGST & SGST Amt (₹)'.
+    - Extract the absolute FULL, COMPLETE legal name for 'Supplier Name' and 'Customer Name' exactly as printed on the document header. Do not shorten or omit any words.
     - Capture the COMPLETE item description exactly as written for every line item.
     
     Output: Return a JSON LIST only.
@@ -105,8 +112,15 @@ if api_key:
             for index, f in enumerate(uploaded_files):
                 status_text.text(f"Processing {f.name}...")
                 progress_bar.progress((index + 1) / len(uploaded_files))
-                items = extract_data_fast(client, f.read(), f.name)
-                st.session_state.all_results.extend(items)
+                
+                file_bytes = f.read()
+                items = extract_data_fast(client, file_bytes, f.name)
+                
+                # Check if the AI returned an empty array indicating a skip condition
+                if not items:
+                    st.info(f"⏭️ Skipped {f.name} (Contains 'NOT FOR SALE' & 'DELIVERY CHALLAN')")
+                else:
+                    st.session_state.all_results.extend(items)
             
             st.success("Extraction Complete!")
 
@@ -134,8 +148,13 @@ if st.session_state.all_results:
                     errors='coerce'
                 ).fillna(0.0)
 
+        # Early raw de-duplication pass to stop stacking on re-clicks
+        df_raw = df_raw.drop_duplicates(
+            subset=["Invoice Number", "Supplier Name", "Item Description"], 
+            keep="first"
+        )
+
         # B. AGGREGATION LOGIC
-        # Group by Invoice Number and Supplier to collapse the 20 items into 1 row
         df_final = df_raw.groupby(["Invoice Number", "Supplier Name"], as_index=False).agg({
             "Invoice Date": "first",
             "Customer Name": "first",
@@ -143,10 +162,9 @@ if st.session_state.all_results:
             "HSN Code": "first",
             "UoM": "first",
             "GST Rate %": "first",
-            # If there are multiple items, replace description with the count
             "Item Description": lambda x: f"{len(x)} ITEMS" if len(x) > 1 else x.iloc[0],
             "Quantity (MT/Nos)": "sum",
-            "Rate per Unit (₹)": "mean", # Average rate for mixed items
+            "Rate per Unit (₹)": "mean",
             "Taxable Value (₹)": "sum",
             "CGST & SGST Amt (₹)": "sum",
             "IGST Amt (₹)": "sum",
