@@ -32,15 +32,17 @@ except Exception:
 def extract_data_fast(client, file_bytes, filename):
     models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-1.5-flash"]
     
+    # Strict Whitelist Strategy via Prompt Engineering
     prompt = f"""
-    Act as a professional construction auditor. Examine the attached PDF document carefully.
+    Act as a professional construction auditor. Examine the attached document visually and textually.
     
-    CRITICAL FILTER RULE:
-    Check if the document contains BOTH the phrase "DELIVERY CHALLAN" and "NOT FOR SALE" anywhere on the pages. 
-    If BOTH phrases are present, you MUST return an empty JSON array [] as the entire output. Do not extract anything.
+    CRITICAL DOCUMENT TYPE GATEWAY RULE:
+    - This application is strictly authorized to process commercial accounting documents.
+    - The document MUST be explicitly titled or legally classified as a "TAX INVOICE", "COMMERCIAL INVOICE", or "BILL OF SUPPLY".
+    - If the document header or text contains phrases like "E-WAY BILL", "DELIVERY CHALLAN", "GOODS CONSIGNMENT NOTE", "LORRY RECEIPT", "TRANSPORT RECEIPT", "PACKING LIST", or "NOT VALID FOR DELIVERY", you MUST block processing entirely.
+    - If it is ANY type of transit/delivery document instead of a true Tax Invoice, return an empty JSON array [] as the entire output. Do not extract anything.
     
-    Otherwise, extract all individual line items from the attached PDF.
-    Target Headers: {HARDCODED_FIELDS}
+    Target Headers for valid Tax Invoices: {HARDCODED_FIELDS}
     
     Mapping Rules:
     - Map synonyms like 'Bill No', 'Voucher', or 'F-Number' to 'Invoice Number'.
@@ -120,10 +122,37 @@ if api_key:
                 file_bytes = f.read()
                 items = extract_data_fast(client, file_bytes, f.name)
                 
-                if not items:
-                    st.info(f"⏭️ Skipped {f.name} (Contains 'NOT FOR SALE' & 'DELIVERY CHALLAN')")
+                # --- UPGRADED PYTHON LEVEL SECURITY LAYER ---
+                # Double-checks data fields to drop rows breaking structural threshold limits
+                valid_items = []
+                for item in items:
+                    inv_num = str(item.get("Invoice Number", "")).upper()
+                    supp_name = str(item.get("Supplier Name", "")).upper()
+                    sap_num = str(item.get("SAP Invoice Number", "")).upper()
+                    
+                    # Clean currency text to perform exact bounding check safely
+                    try:
+                        raw_val_str = str(item.get("Taxable Value (₹)", "0")).replace(',', '').replace('₹', '').strip()
+                        extracted_taxable_row = float(raw_val_str) if raw_val_str else 0.0
+                    except ValueError:
+                        extracted_taxable_row = 0.0
+                    
+                    # 1. Keyword check wall
+                    if any(x in inv_num for x in ["CHALLAN", "EWAY", "LR-", "GR-", "NOTE"]) or "CARRIER" in supp_name:
+                        continue
+                    if any(x in sap_num for x in ["CHALLAN", "EWAY", "E-WAY"]):
+                        continue
+                        
+                    # 2. Max Row Threshold Filter (Safely catches and flags multi-crore e-way bill token-gluing leaks)
+                    if extracted_taxable_row > 25000000.0:
+                        continue
+                        
+                    valid_items.append(item)
+                
+                if not valid_items:
+                    st.info(f"⏭️ Skipped {f.name} (Non-Invoice Document Bypassed)")
                 else:
-                    st.session_state.all_results.extend(items)
+                    st.session_state.all_results.extend(valid_items)
             
             st.success("Extraction Complete!")
 
@@ -133,8 +162,13 @@ if st.session_state.all_results:
     df_raw = pd.DataFrame(st.session_state.all_results)
     
     if not df_raw.empty:
+        # Schema assurance loop to securely eliminate any KeyErrors
+        for field in HARDCODED_FIELDS:
+            if field not in df_raw.columns:
+                df_raw[field] = "N/A"
+
         # A. PRE-CLEANING: Normalize strings and fix numbers before grouping
-        text_cols = ["Invoice Number", "Supplier Name", "Item Description", "UoM", "HSN Code", "Customer Name", "Invoice Date"]
+        text_cols = ["Invoice Number", "Supplier Name", "Item Description", "UoM", "HSN Code", "Customer Name", "Invoice Date", "SAP Invoice Number"]
         for col in text_cols:
             if col in df_raw.columns:
                 df_raw[col] = df_raw[col].astype(str).str.strip().str.upper().replace('NAN', 'N/A')
@@ -151,13 +185,13 @@ if st.session_state.all_results:
                     errors='coerce'
                 ).fillna(0.0)
 
-        # Early raw de-duplication pass to stop stacking on re-clicks
+        # Early raw de-duplication pass
         df_raw = df_raw.drop_duplicates(
             subset=["Invoice Number", "Supplier Name", "Item Description"], 
             keep="first"
         )
 
-        # Programmatic Mathematical Re-validation Pass for individual components
+        # --- EARLY ROW-LEVEL MATHEMATICAL RE-VALIDATION PASS ---
         for idx, row in df_raw.iterrows():
             rate = row.get("GST Rate %", 0)
             if rate <= 0 or rate > 28:
@@ -173,6 +207,13 @@ if st.session_state.all_results:
             else:
                 df_raw.at[idx, "IGST Amt (₹)"] = calc_tax
                 df_raw.at[idx, "CGST & SGST Amt (₹)"] = 0.0
+                
+            df_raw.at[idx, "Total Invoice Value (₹)"] = round(
+                df_raw.at[idx, "Taxable Value (₹)"] + 
+                df_raw.at[idx, "CGST & SGST Amt (₹)"] + 
+                df_raw.at[idx, "IGST Amt (₹)"] + 
+                df_raw.at[idx, "Freight Charges (₹)"], 2
+            )
 
         # B. AGGREGATION LOGIC
         df_final = df_raw.groupby(["Invoice Number", "Supplier Name"], as_index=False).agg({
@@ -192,8 +233,7 @@ if st.session_state.all_results:
             "Total Invoice Value (₹)": "sum"
         })
         
-        # --- FIX: HARD MATHEMATICAL RECONCILIATION FOR TOTAL INVOICE VALUE ---
-        # Instead of trusting a fuzzy mask, forcefully overwrite total value to guarantee balance math
+        # Hard mathematical reconciliation safety net pass
         df_final["Total Invoice Value (₹)"] = (
             df_final["Taxable Value (₹)"] + 
             df_final["CGST & SGST Amt (₹)"] + 
@@ -224,4 +264,5 @@ if st.session_state.all_results:
     
     with col_clr:
         if st.button("🗑️ Clear All Results"):
-            st.session_state.all_results = []; st.rerun()
+            st.session_state.all_results = []
+            st.rerun()
